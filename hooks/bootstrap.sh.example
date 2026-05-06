@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# bootstrap.sh — runs after WorktreeCreate sets up the new worktree's DB +
+# .env. Rename to `bootstrap.sh`, make it executable, and point at it from
+# `.claude/hooks/worktree-isolation.conf`:
+#
+#   BOOTSTRAP_HOOK=.claude/hooks/bootstrap.sh
+#
+# Available environment variables:
+#   WORKTREE_PATH   absolute path to the new worktree
+#   DB_NAME         name of the per-worktree Postgres database
+#   REDIS_DB        Redis logical DB number (1-15)
+#
+# `cd` is already set to $WORKTREE_PATH when this script runs.
+# stderr is captured by the hook and shown with a [bootstrap] prefix.
+# Non-zero exit is logged as a warning but does not block the worktree.
+
+set -euo pipefail
+
+# --- example: Python (uv + alembic) ---
+# uv sync
+# (cd apps/api && uv run alembic upgrade head)
+
+# --- example: Node ---
+# npm install
+# (cd apps/web && npm run db:migrate)
+
+# --- example: mixed monorepo ---
+# uv sync
+# (cd apps/api && uv run alembic upgrade head)
+# (cd apps/web && npm install)
+
+echo "bootstrap.sh: replace this with project-specific setup commands"

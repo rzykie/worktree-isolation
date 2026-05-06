@@ -1,0 +1,38 @@
+# worktree-isolation.conf — sourced as bash by the create/remove hooks.
+# Drop this at .claude/hooks/worktree-isolation.conf in your project.
+
+# Logical name for this repo. Stored in the registry so you can tell which
+# repo allocated which slug. Any string; pair repos that should share slots
+# by giving them the same REGISTRY_PATH (not the same REPO_NAME).
+REPO_NAME=myapp
+
+# Where new worktrees land on disk. One subdirectory per slug.
+WORKTREES_ROOT=$HOME/.claude/worktrees/myapp
+
+# Shared registry file. Two repos with the same REGISTRY_PATH will
+# co-allocate to the same DB+Redis slot when their slugified branch
+# names match (e.g. backend `feat/foo` + frontend `foo` both map to
+# slug `foo`).
+REGISTRY_PATH=$HOME/.myapp-worktrees.json
+
+# Prefix for the per-worktree Postgres DB name. Final name is
+# ${DB_PREFIX}${slug}, e.g. myapp_feature_x.
+DB_PREFIX=myapp_
+
+# Optional Postgres template DB. If set, new worktree DBs are created as
+# CREATE DATABASE ... TEMPLATE <TEMPLATE_DB>; — fastest way to clone an
+# existing schema + seed data. Leave empty to create empty databases
+# (and let the bootstrap hook run migrations).
+TEMPLATE_DB=myapp_dev
+
+# Branch to fork new worktrees from when the branch doesn't exist yet.
+# Leave empty to use whatever branch the main checkout has checked out.
+BASE_BRANCH=develop
+
+# Optional bootstrap script (path relative to the worktree root). Runs
+# after the DB is created and .env rewritten. See bootstrap.sh.example.
+BOOTSTRAP_HOOK=.claude/hooks/bootstrap.sh
+
+# File listing untracked-but-needed files to copy from the main checkout
+# into each worktree (e.g. .env, local secrets). One path per line.
+WORKTREE_INCLUDE_FILE=.worktreeinclude
