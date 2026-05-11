@@ -1,0 +1,874 @@
+#!/usr/bin/env python3
+"""wti — per-worktree Postgres + Redis isolation.
+
+`git worktree` gives you isolated files. It does not give you isolated
+databases or queues. This tool allocates a dedicated Postgres database and
+a Redis logical DB (1-15) per worktree, rewrites the worktree's .env to
+point at them, and cleans up on removal. It self-heals: if a worktree
+disappears without going through `wti remove`, the next `create` or
+`sweep` evicts the stale registry entry and reclaims the slot.
+
+Usage:
+  wti create <branch>     create worktree, allocate DB + Redis, run bootstrap
+  wti remove <branch>     remove worktree, release slot, drop DB if last user
+  wti list                show active worktrees
+  wti inspect [<slug>]    dump registry (or one slug)
+  wti sweep               evict stale entries, drop orphan DBs/Redis
+  wti env <branch>        print KEY=VAL facts about a worktree (eval-friendly)
+  wti acquire / release   low-level registry slot ops (no git/db/env)
+
+Run `wti <cmd> --help` for flags.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+# ----------------------------------------------------------------------------
+# Exit codes (documented contract)
+# ----------------------------------------------------------------------------
+EXIT_OK = 0
+EXIT_RUNTIME = 1   # git/DB/Redis/bootstrap failed
+EXIT_USAGE = 2     # bad flags or missing required config
+EXIT_NOT_FOUND = 3 # remove/inspect a slug that isn't in the registry
+EXIT_CONFLICT = 4  # path exists and isn't ours, slug taken by another repo
+
+VERSION = "0.2.0"
+
+# ----------------------------------------------------------------------------
+# Output helpers. Progress goes to stderr; JSON results go to stdout.
+# ----------------------------------------------------------------------------
+_QUIET = False
+_VERBOSE = False
+
+
+def log(msg: str) -> None:
+    if _QUIET:
+        return
+    print(f"[wti] {msg}", file=sys.stderr)
+
+
+def vlog(msg: str) -> None:
+    if _VERBOSE and not _QUIET:
+        print(f"[wti] {msg}", file=sys.stderr)
+
+
+def warn(msg: str) -> None:
+    print(f"[wti] WARN: {msg}", file=sys.stderr)
+
+
+def die(msg: str, code: int = EXIT_RUNTIME) -> "NoReturn":  # type: ignore[name-defined]
+    print(f"[wti] ERR: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def emit_json(obj: dict) -> None:
+    """Emit a single JSON object on stdout (for --json mode)."""
+    print(json.dumps(obj))
+
+
+# ----------------------------------------------------------------------------
+# Config loading. Layered: defaults < config file < env < CLI flags.
+# ----------------------------------------------------------------------------
+
+CONFIG_KEYS = {
+    "REPO_NAME",
+    "WORKTREES_ROOT",
+    "REGISTRY_PATH",
+    "DB_PREFIX",
+    "TEMPLATE_DB",
+    "BASE_BRANCH",
+    "BOOTSTRAP_HOOK",
+    "WORKTREE_INCLUDE_FILE",
+    "MAX_REDIS_DB",
+    "PG_HOST",
+    "REDIS_HOST",
+}
+
+# Mapping from WTI_* env var to canonical config key.
+ENV_MAP = {
+    "WTI_REPO": "REPO_NAME",
+    "WTI_WORKTREES_ROOT": "WORKTREES_ROOT",
+    "WTI_REGISTRY": "REGISTRY_PATH",
+    "WTI_DB_PREFIX": "DB_PREFIX",
+    "WTI_TEMPLATE_DB": "TEMPLATE_DB",
+    "WTI_BASE_BRANCH": "BASE_BRANCH",
+    "WTI_BOOTSTRAP": "BOOTSTRAP_HOOK",
+    "WTI_INCLUDE_FILE": "WORKTREE_INCLUDE_FILE",
+    "WTI_MAX_REDIS_DB": "MAX_REDIS_DB",
+    "WTI_PG_HOST": "PG_HOST",
+    "WTI_REDIS_HOST": "REDIS_HOST",
+}
+
+DEFAULTS = {
+    "DB_PREFIX": "wt_",
+    "WORKTREE_INCLUDE_FILE": ".worktreeinclude",
+    "MAX_REDIS_DB": "15",
+}
+
+
+def _expand(val: str) -> str:
+    """Expand ~ and $VAR references the way the legacy bash conf files did."""
+    return os.path.expanduser(os.path.expandvars(val))
+
+
+def _parse_conf_file(path: Path) -> dict[str, str]:
+    """Parse KEY=VALUE lines. Tolerates blank lines and `#` comments. Strips
+    surrounding quotes. Expands ~ and $VAR. Compatible with the legacy
+    .claude/hooks/worktree-isolation.conf bash format provided values don't
+    rely on bash-only constructs (command substitution, etc.)."""
+    out: dict[str, str] = {}
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip()
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            val = val[1:-1]
+        if key in CONFIG_KEYS:
+            out[key] = _expand(val)
+    return out
+
+
+def _find_config_file(explicit: str | None) -> Path | None:
+    if explicit:
+        p = Path(explicit).expanduser()
+        if not p.exists():
+            die(f"config file not found: {p}", EXIT_USAGE)
+        return p
+    env_path = os.environ.get("WTI_CONFIG")
+    if env_path:
+        p = Path(env_path).expanduser()
+        if not p.exists():
+            die(f"config file from $WTI_CONFIG not found: {p}", EXIT_USAGE)
+        return p
+    cwd = Path.cwd()
+    candidates = [
+        cwd / ".wti.conf",
+        cwd / ".claude" / "hooks" / "worktree-isolation.conf",  # back-compat
+        Path.home() / ".config" / "wti" / "config",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def load_config(args: argparse.Namespace) -> dict[str, str]:
+    """Build the effective config dict for this invocation."""
+    cfg = dict(DEFAULTS)
+    conf_file = _find_config_file(getattr(args, "config", None))
+    if conf_file is not None:
+        vlog(f"loaded config: {conf_file}")
+        cfg.update(_parse_conf_file(conf_file))
+    for env_key, conf_key in ENV_MAP.items():
+        if env_key in os.environ and os.environ[env_key]:
+            cfg[conf_key] = _expand(os.environ[env_key])
+    # Flag overrides — only present on subcommands that accept them.
+    flag_map = {
+        "repo": "REPO_NAME",
+        "worktrees_root": "WORKTREES_ROOT",
+        "registry": "REGISTRY_PATH",
+        "db_prefix": "DB_PREFIX",
+        "template_db": "TEMPLATE_DB",
+        "base_branch": "BASE_BRANCH",
+        "bootstrap": "BOOTSTRAP_HOOK",
+        "include_file": "WORKTREE_INCLUDE_FILE",
+    }
+    for attr, key in flag_map.items():
+        v = getattr(args, attr, None)
+        if v:
+            cfg[key] = _expand(v)
+    if getattr(args, "no_bootstrap", False):
+        cfg["BOOTSTRAP_HOOK"] = ""
+    return cfg
+
+
+def require(cfg: dict[str, str], *keys: str) -> None:
+    missing = [k for k in keys if not cfg.get(k)]
+    if missing:
+        die(f"missing required config: {', '.join(missing)} "
+            f"(set in .wti.conf, $WTI_*, or via flags)", EXIT_USAGE)
+
+
+# ----------------------------------------------------------------------------
+# Slug derivation. Two repos with related branch names ("feat/foo" and "foo")
+# slugify to the same slug and so co-allocate to the same DB.
+# ----------------------------------------------------------------------------
+
+_BRANCH_PREFIXES = ("feat/", "feature/", "fix/", "bugfix/", "chore/", "exp/")
+
+
+def slugify_branch(branch: str) -> str:
+    s = branch
+    for p in _BRANCH_PREFIXES:
+        if s.startswith(p):
+            s = s[len(p):]
+            break
+    s = s.translate(str.maketrans({"/": "_", "-": "_"})).lower()
+    s = re.sub(r"[^a-z0-9_]", "_", s)
+    return s[:30]
+
+
+# ----------------------------------------------------------------------------
+# Registry. Atomic JSON file with fcntl.flock.
+# ----------------------------------------------------------------------------
+
+def _now_iso() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class Registry:
+    def __init__(self, path: Path, db_prefix: str, max_redis_db: int):
+        self.path = path
+        self.db_prefix = db_prefix
+        self.max_redis_db = max_redis_db
+
+    def _open_locked(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.touch(exist_ok=True)
+        f = self.path.open("r+")
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        return f
+
+    @staticmethod
+    def _load(f) -> dict:
+        raw = f.read().strip()
+        if not raw:
+            return {"slugs": {}}
+        data = json.loads(raw)
+        data.setdefault("slugs", {})
+        return data
+
+    @staticmethod
+    def _save(f, data: dict) -> None:
+        f.seek(0)
+        f.truncate()
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+    def _first_free_redis_db(self, data: dict) -> int:
+        used = {entry["redis_db"] for entry in data["slugs"].values()}
+        for n in range(1, self.max_redis_db + 1):
+            if n not in used:
+                return n
+        die(f"all {self.max_redis_db} Redis DB slots are in use")
+
+    @staticmethod
+    def _sweep_stale(data: dict) -> list[dict]:
+        evicted = []
+        for slug in list(data["slugs"].keys()):
+            entry = data["slugs"][slug]
+            live = [m for m in entry["members"] if Path(m["path"]).exists()]
+            if not live:
+                evicted.append({
+                    "slug": slug,
+                    "db_name": entry["db_name"],
+                    "redis_db": entry["redis_db"],
+                })
+                del data["slugs"][slug]
+            elif len(live) != len(entry["members"]):
+                entry["members"] = live
+        return evicted
+
+    def acquire(self, slug: str, repo: str, path: str) -> dict:
+        f = self._open_locked()
+        try:
+            data = self._load(f)
+            evicted = self._sweep_stale(data)
+            if evicted:
+                vlog(f"swept stale slugs: {', '.join(e['slug'] for e in evicted)}")
+            if slug in data["slugs"]:
+                entry = data["slugs"][slug]
+                paths = {m["path"] for m in entry["members"]}
+                if path not in paths:
+                    entry["members"].append({"repo": repo, "path": path})
+                is_new = False
+            else:
+                entry = {
+                    "db_name": f"{self.db_prefix}{slug}",
+                    "redis_db": self._first_free_redis_db(data),
+                    "created_at": _now_iso(),
+                    "members": [{"repo": repo, "path": path}],
+                }
+                data["slugs"][slug] = entry
+                is_new = True
+            self._save(f, data)
+            return {
+                "slug": slug,
+                "db_name": entry["db_name"],
+                "redis_db": entry["redis_db"],
+                "is_new": is_new,
+                "swept": evicted,
+            }
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            f.close()
+
+    def release(self, path: str) -> dict:
+        empty = {"found": False, "is_last": False, "db_name": None,
+                 "redis_db": None, "slug": None}
+        if not self.path.exists():
+            return empty
+        f = self._open_locked()
+        try:
+            data = self._load(f)
+            target_slug = None
+            for slug, entry in data["slugs"].items():
+                if any(m["path"] == path for m in entry["members"]):
+                    target_slug = slug
+                    break
+            if target_slug is None:
+                return empty
+            entry = data["slugs"][target_slug]
+            entry["members"] = [m for m in entry["members"] if m["path"] != path]
+            result = {
+                "found": True,
+                "is_last": len(entry["members"]) == 0,
+                "db_name": entry["db_name"],
+                "redis_db": entry["redis_db"],
+                "slug": target_slug,
+            }
+            if result["is_last"]:
+                del data["slugs"][target_slug]
+            self._save(f, data)
+            return result
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            f.close()
+
+    def sweep(self) -> list[dict]:
+        if not self.path.exists():
+            return []
+        f = self._open_locked()
+        try:
+            data = self._load(f)
+            evicted = self._sweep_stale(data)
+            self._save(f, data)
+            return evicted
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            f.close()
+
+    def dump(self) -> dict:
+        if not self.path.exists():
+            return {"slugs": {}}
+        return json.loads(self.path.read_text() or '{"slugs": {}}')
+
+    def find_by_slug(self, slug: str) -> dict | None:
+        return self.dump()["slugs"].get(slug)
+
+
+def make_registry(cfg: dict[str, str]) -> Registry:
+    require(cfg, "REGISTRY_PATH")
+    return Registry(
+        Path(cfg["REGISTRY_PATH"]).expanduser(),
+        cfg.get("DB_PREFIX", "wt_"),
+        int(cfg.get("MAX_REDIS_DB", "15")),
+    )
+
+
+# ----------------------------------------------------------------------------
+# Subprocess helpers.
+# ----------------------------------------------------------------------------
+
+def run(cmd: list[str], *, prefix: str | None = None,
+        cwd: str | None = None, env: dict[str, str] | None = None,
+        check: bool = True) -> subprocess.CompletedProcess:
+    """Run a command, streaming its stderr through ours with an optional
+    [prefix]. Returns the CompletedProcess. Raises on non-zero exit when
+    check=True (caller catches CalledProcessError to handle partial state).
+    """
+    vlog(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
+    p = subprocess.run(
+        cmd,
+        cwd=cwd,
+        env={**os.environ, **(env or {})},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if p.stderr:
+        for line in p.stderr.rstrip().splitlines():
+            print(f"[{prefix}] {line}" if prefix else line, file=sys.stderr)
+    if check and p.returncode != 0:
+        raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
+    return p
+
+
+def git(repo: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return run(["git", "-C", repo, *args], prefix="git", check=check)
+
+
+def psql_exec(sql: str, *, host: str | None = None) -> None:
+    cmd = ["psql", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c", sql]
+    if host:
+        cmd[1:1] = ["-h", host]
+    run(cmd, prefix="psql")
+
+
+def redis_flush(db_n: int, *, host: str | None = None) -> None:
+    cmd = ["redis-cli", "-n", str(db_n), "FLUSHDB"]
+    if host:
+        cmd[1:1] = ["-h", host]
+    run(cmd, prefix="redis", check=False)
+
+
+# ----------------------------------------------------------------------------
+# .env rewriting + include-file copying.
+# ----------------------------------------------------------------------------
+
+_PG_KEY = re.compile(r"^\s*(DATABASE_URL|ALEMBIC_DATABASE_URL)\s*=")
+_REDIS_KEY = re.compile(r"^\s*REDIS_URL\s*=")
+_PG_SUB = re.compile(
+    r"^(\s*(?:DATABASE_URL|ALEMBIC_DATABASE_URL)\s*=\s*postgresql"
+    r"(?:\+asyncpg|\+psycopg|\+psycopg2)?://[^/\s]+/)[^\s]+"
+)
+_REDIS_SUB = re.compile(r"^(\s*REDIS_URL\s*=\s*redis://[^/\s]+)/\d+")
+
+
+def apply_env_overrides(env_path: Path, db_name: str, redis_db: int) -> None:
+    if not env_path.is_file():
+        log(f"skip env override (file missing): {env_path}")
+        return
+    out = []
+    for line in env_path.read_text().splitlines():
+        s = line
+        if _PG_KEY.match(s):
+            s = _PG_SUB.sub(rf"\g<1>{db_name}", s)
+        if _REDIS_KEY.match(s):
+            s = _REDIS_SUB.sub(rf"\g<1>/{redis_db}", s)
+        out.append(s)
+    env_path.write_text("\n".join(out) + "\n")
+    log(f"rewrote DB/Redis URLs in {env_path}")
+
+
+def copy_worktree_includes(main_root: Path, worktree_root: Path,
+                           include_file: Path) -> None:
+    if not include_file.is_file():
+        vlog(f"no {include_file.name} at {include_file}; skipping copy")
+        return
+    for raw in include_file.read_text().splitlines():
+        rel = raw.strip()
+        if not rel or rel.startswith("#"):
+            continue
+        src = main_root / rel
+        dst = worktree_root / rel
+        if src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            log(f"copied {rel}")
+        else:
+            vlog(f"skipped (not in main): {rel}")
+
+
+# ----------------------------------------------------------------------------
+# Bootstrap runner.
+# ----------------------------------------------------------------------------
+
+def run_bootstrap(worktree_path: Path, hook_rel: str,
+                  db_name: str, redis_db: int) -> str:
+    """Returns one of: 'ok', 'skipped', 'failed'. Never raises — bootstrap
+    failure is logged but doesn't fail worktree creation."""
+    if not hook_rel:
+        return "skipped"
+    hook = worktree_path / hook_rel
+    if not hook.is_file() or not os.access(hook, os.X_OK):
+        warn(f"BOOTSTRAP_HOOK='{hook_rel}' set but file missing or not executable")
+        return "failed"
+    log(f"running bootstrap: {hook_rel}")
+    p = subprocess.run(
+        [str(hook)],
+        cwd=str(worktree_path),
+        env={
+            **os.environ,
+            "WORKTREE_PATH": str(worktree_path),
+            "DB_NAME": db_name,
+            "REDIS_DB": str(redis_db),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    for stream in (p.stdout, p.stderr):
+        for line in (stream or "").rstrip().splitlines():
+            print(f"[bootstrap] {line}", file=sys.stderr)
+    if p.returncode != 0:
+        warn(f"bootstrap hook exited {p.returncode}; check the worktree manually")
+        return "failed"
+    return "ok"
+
+
+# ----------------------------------------------------------------------------
+# Commands.
+# ----------------------------------------------------------------------------
+
+def find_repo_root(start: Path | None = None) -> Path:
+    p = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=str(start) if start else None,
+        capture_output=True, text=True, check=False,
+    )
+    if p.returncode != 0:
+        die("not inside a git repository (run `wti` from your repo)", EXIT_USAGE)
+    return Path(p.stdout.strip())
+
+
+def cmd_create(args: argparse.Namespace) -> int:
+    cfg = load_config(args)
+    require(cfg, "REPO_NAME", "WORKTREES_ROOT", "REGISTRY_PATH", "DB_PREFIX")
+
+    branch = args.branch
+    slug = slugify_branch(branch)
+    if not slug:
+        die(f"could not derive slug from branch='{branch}'", EXIT_USAGE)
+
+    repo_root = find_repo_root()
+    worktrees_root = Path(cfg["WORKTREES_ROOT"]).expanduser()
+    worktree_path = worktrees_root / slug
+
+    if args.dry_run:
+        log(f"DRY-RUN: would create worktree at {worktree_path}")
+        log(f"DRY-RUN: branch={branch} slug={slug} repo={cfg['REPO_NAME']}")
+        log(f"DRY-RUN: db prefix={cfg['DB_PREFIX']} (final={cfg['DB_PREFIX']}{slug})")
+        log(f"DRY-RUN: registry={cfg['REGISTRY_PATH']}")
+        if cfg.get("TEMPLATE_DB"):
+            log(f"DRY-RUN: TEMPLATE {cfg['TEMPLATE_DB']}")
+        if cfg.get("BOOTSTRAP_HOOK"):
+            log(f"DRY-RUN: bootstrap={cfg['BOOTSTRAP_HOOK']}")
+        return EXIT_OK
+
+    log(f"{cfg['REPO_NAME']}: branch={branch} slug={slug} path={worktree_path}")
+    worktrees_root.mkdir(parents=True, exist_ok=True)
+
+    # 1. git worktree.
+    if worktree_path.exists():
+        warn(f"{worktree_path} already exists; reusing")
+    else:
+        try:
+            branch_exists = git(str(repo_root), "show-ref", "--verify", "--quiet",
+                                f"refs/heads/{branch}", check=False).returncode == 0
+            if branch_exists:
+                log(f"branch '{branch}' exists; checking it out at {worktree_path}")
+                git(str(repo_root), "worktree", "add", str(worktree_path), branch)
+            else:
+                base = cfg.get("BASE_BRANCH") or git(
+                    str(repo_root), "symbolic-ref", "--short", "HEAD", check=False
+                ).stdout.strip() or "main"
+                log(f"branch '{branch}' is new; creating from '{base}' at {worktree_path}")
+                git(str(repo_root), "worktree", "add", "-b", branch,
+                    str(worktree_path), base)
+        except subprocess.CalledProcessError:
+            die("git worktree add failed", EXIT_RUNTIME)
+
+    # 2. Acquire registry slot.
+    reg = make_registry(cfg)
+    slot = reg.acquire(slug, cfg["REPO_NAME"], str(worktree_path))
+    db_name = slot["db_name"]
+    redis_db = slot["redis_db"]
+    log(f"registry: db={db_name} redis_db={redis_db} is_new={slot['is_new']}")
+
+    # 3. CREATE DATABASE if first acquirer.
+    if slot["is_new"]:
+        template = cfg.get("TEMPLATE_DB", "")
+        if template:
+            log(f"creating database {db_name} via TEMPLATE {template}")
+            sql = f'CREATE DATABASE "{db_name}" TEMPLATE "{template}";'
+        else:
+            log(f"creating empty database {db_name}")
+            sql = f'CREATE DATABASE "{db_name}";'
+        try:
+            psql_exec(sql, host=cfg.get("PG_HOST"))
+        except subprocess.CalledProcessError:
+            warn(f"CREATE DATABASE failed. If template '{template}' is in use, "
+                 f"stop the process holding it and retry. To roll back: "
+                 f"`wti release --path {worktree_path}`")
+            return EXIT_RUNTIME
+    else:
+        log(f"DB {db_name} already created by sister repo; reusing")
+
+    # 4. Copy includes + rewrite env.
+    include_file = repo_root / cfg.get("WORKTREE_INCLUDE_FILE", ".worktreeinclude")
+    copy_worktree_includes(repo_root, worktree_path, include_file)
+    apply_env_overrides(worktree_path / ".env", db_name, redis_db)
+
+    # 5. Bootstrap.
+    bootstrap_status = run_bootstrap(worktree_path, cfg.get("BOOTSTRAP_HOOK", ""),
+                                     db_name, redis_db)
+
+    log(f"worktree ready: {worktree_path} (db={db_name} redis_db={redis_db})")
+
+    if args.json:
+        emit_json({
+            "branch": branch,
+            "slug": slug,
+            "repo": cfg["REPO_NAME"],
+            "path": str(worktree_path),
+            "db_name": db_name,
+            "redis_db": redis_db,
+            "is_new": slot["is_new"],
+            "bootstrap_status": bootstrap_status,
+        })
+    return EXIT_OK
+
+
+def _drop_slot(slug: str, db_name: str, redis_db: int, cfg: dict[str, str]) -> None:
+    log(f"flushing redis db={redis_db} (slug={slug})")
+    redis_flush(redis_db, host=cfg.get("REDIS_HOST"))
+    log(f"dropping database {db_name} (slug={slug})")
+    try:
+        psql_exec(f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE);',
+                  host=cfg.get("PG_HOST"))
+    except subprocess.CalledProcessError:
+        warn(f"DROP DATABASE {db_name} failed; you may need to drop manually")
+
+
+def cmd_remove(args: argparse.Namespace) -> int:
+    cfg = load_config(args)
+    require(cfg, "WORKTREES_ROOT", "REGISTRY_PATH")
+
+    if args.path:
+        worktree_path = Path(args.path).expanduser().resolve()
+    elif args.branch:
+        slug = slugify_branch(args.branch)
+        worktree_path = Path(cfg["WORKTREES_ROOT"]).expanduser() / slug
+    else:
+        die("either <branch> or --path is required", EXIT_USAGE)
+
+    log(f"removing worktree: {worktree_path}")
+
+    # Try to git-worktree-remove first if the path exists. Failures here are
+    # logged but don't block registry release.
+    repo_root: Path | None = None
+    try:
+        repo_root = find_repo_root()
+    except SystemExit:
+        pass
+    if repo_root and worktree_path.exists():
+        try:
+            args_list = ["worktree", "remove", str(worktree_path)]
+            if args.force:
+                args_list.append("--force")
+            git(str(repo_root), *args_list)
+        except subprocess.CalledProcessError:
+            warn("git worktree remove failed; proceeding with registry cleanup")
+
+    reg = make_registry(cfg)
+    rel = reg.release(str(worktree_path))
+    if rel["found"]:
+        log(f"released slot for slug={rel['slug']} "
+            f"(is_last={rel['is_last']} db={rel['db_name']} redis_db={rel['redis_db']})")
+        if rel["is_last"]:
+            _drop_slot(rel["slug"], rel["db_name"], rel["redis_db"], cfg)
+    else:
+        log(f"no registry entry for path={worktree_path}")
+
+    # Opportunistic sweep — closes the loop when other worktrees were
+    # removed without going through `wti remove`.
+    swept = reg.sweep()
+    for e in swept:
+        log(f"auto-cleanup: evicted stale slug={e['slug']} "
+            f"(db={e['db_name']} redis_db={e['redis_db']})")
+        _drop_slot(e["slug"], e["db_name"], e["redis_db"], cfg)
+
+    if args.json:
+        emit_json({
+            "path": str(worktree_path),
+            "released": rel,
+            "swept": swept,
+        })
+    return EXIT_OK if rel["found"] else EXIT_NOT_FOUND
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    cfg = load_config(args)
+    reg = make_registry(cfg)
+    data = reg.dump()
+    if args.json:
+        emit_json(data)
+        return EXIT_OK
+    slugs = data.get("slugs", {})
+    if not slugs:
+        print("(no worktrees)", file=sys.stderr)
+        return EXIT_OK
+    rows = [("SLUG", "REPO", "PATH", "DB", "REDIS")]
+    for slug, entry in sorted(slugs.items()):
+        for m in entry["members"]:
+            rows.append((slug, m["repo"], m["path"], entry["db_name"], str(entry["redis_db"])))
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)))
+    return EXIT_OK
+
+
+def cmd_inspect(args: argparse.Namespace) -> int:
+    cfg = load_config(args)
+    reg = make_registry(cfg)
+    data = reg.dump()
+    if args.slug:
+        entry = data["slugs"].get(args.slug)
+        if entry is None:
+            die(f"slug not found: {args.slug}", EXIT_NOT_FOUND)
+        print(json.dumps({args.slug: entry}, indent=2))
+    else:
+        print(json.dumps(data, indent=2))
+    return EXIT_OK
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    cfg = load_config(args)
+    reg = make_registry(cfg)
+    evicted = reg.sweep()
+    for e in evicted:
+        log(f"evicted stale slug={e['slug']} (db={e['db_name']} redis_db={e['redis_db']})")
+        _drop_slot(e["slug"], e["db_name"], e["redis_db"], cfg)
+    if args.json:
+        emit_json({"evicted": evicted})
+    elif not evicted:
+        log("registry clean; nothing to evict")
+    return EXIT_OK
+
+
+def cmd_env(args: argparse.Namespace) -> int:
+    cfg = load_config(args)
+    reg = make_registry(cfg)
+    slug = slugify_branch(args.branch)
+    entry = reg.find_by_slug(slug)
+    if entry is None:
+        die(f"no worktree for branch '{args.branch}' (slug={slug})", EXIT_NOT_FOUND)
+    repo_filter = cfg.get("REPO_NAME")
+    members = entry["members"]
+    if repo_filter:
+        members = [m for m in members if m["repo"] == repo_filter] or entry["members"]
+    path = members[0]["path"]
+    print(f"WTI_SLUG={slug}")
+    print(f"WTI_PATH={path}")
+    print(f"WTI_DB_NAME={entry['db_name']}")
+    print(f"WTI_REDIS_DB={entry['redis_db']}")
+    return EXIT_OK
+
+
+def cmd_acquire(args: argparse.Namespace) -> int:
+    """Low-level: claim a slot without doing any of the surrounding work
+    (no git worktree, no CREATE DATABASE, no env rewrite, no bootstrap)."""
+    cfg = load_config(args)
+    require(cfg, "REPO_NAME", "REGISTRY_PATH")
+    reg = make_registry(cfg)
+    slot = reg.acquire(args.slug, cfg["REPO_NAME"], args.path)
+    emit_json(slot)
+    return EXIT_OK
+
+
+def cmd_release(args: argparse.Namespace) -> int:
+    cfg = load_config(args)
+    reg = make_registry(cfg)
+    rel = reg.release(args.path)
+    emit_json(rel)
+    return EXIT_OK if rel["found"] else EXIT_NOT_FOUND
+
+
+# ----------------------------------------------------------------------------
+# argparse wiring.
+# ----------------------------------------------------------------------------
+
+def _add_config_flags(p: argparse.ArgumentParser, *, full: bool = True) -> None:
+    """Attach config-override flags to a subparser. `full=False` for
+    low-level commands that only need a registry pointer."""
+    p.add_argument("--config", help="explicit config file path")
+    p.add_argument("--registry", help="path to shared registry JSON file")
+    p.add_argument("--db-prefix", help="prefix for generated DB names")
+    if full:
+        p.add_argument("--repo", help="logical repo name")
+        p.add_argument("--worktrees-root", help="parent directory for worktrees")
+        p.add_argument("--template-db", help="Postgres TEMPLATE database name")
+        p.add_argument("--base-branch", help="branch to fork new worktrees from")
+        p.add_argument("--bootstrap", help="path (relative to worktree) to setup script")
+        p.add_argument("--no-bootstrap", action="store_true",
+                       help="skip bootstrap even if configured")
+        p.add_argument("--include-file", help="path to .worktreeinclude listing")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="wti", description=__doc__.splitlines()[0])
+    p.add_argument("--version", action="version", version=f"wti {VERSION}")
+    p.add_argument("-q", "--quiet", action="store_true", help="suppress progress logs")
+    p.add_argument("-v", "--verbose", action="store_true", help="extra progress detail")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("create", help="create a worktree with isolated DB + Redis")
+    c.add_argument("branch", help="branch name (e.g. feat/checkout-flow)")
+    c.add_argument("--json", action="store_true", help="emit JSON result on stdout")
+    c.add_argument("--dry-run", action="store_true",
+                   help="print plan without doing anything")
+    _add_config_flags(c)
+    c.set_defaults(func=cmd_create)
+
+    r = sub.add_parser("remove", help="remove a worktree and release its slot")
+    r.add_argument("branch", nargs="?", help="branch name (alternative to --path)")
+    r.add_argument("--path", help="absolute worktree path (alternative to <branch>)")
+    r.add_argument("--force", action="store_true",
+                   help="pass --force to `git worktree remove`")
+    r.add_argument("--json", action="store_true")
+    _add_config_flags(r)
+    r.set_defaults(func=cmd_remove)
+
+    ls = sub.add_parser("list", help="show active worktrees")
+    ls.add_argument("--json", action="store_true")
+    _add_config_flags(ls, full=False)
+    ls.set_defaults(func=cmd_list)
+
+    ins = sub.add_parser("inspect", help="dump registry as JSON")
+    ins.add_argument("slug", nargs="?", help="show only this slug")
+    _add_config_flags(ins, full=False)
+    ins.set_defaults(func=cmd_inspect)
+
+    sw = sub.add_parser("sweep", help="evict stale entries; drop orphan DBs/Redis")
+    sw.add_argument("--json", action="store_true")
+    _add_config_flags(sw, full=False)
+    sw.set_defaults(func=cmd_sweep)
+
+    en = sub.add_parser("env", help="print KEY=VAL facts about a worktree")
+    en.add_argument("branch")
+    _add_config_flags(en, full=False)
+    en.set_defaults(func=cmd_env)
+
+    a = sub.add_parser("acquire", help="low-level: claim a registry slot only")
+    a.add_argument("--slug", required=True)
+    a.add_argument("--path", required=True)
+    _add_config_flags(a, full=False)
+    a.add_argument("--repo", help="logical repo name")
+    a.set_defaults(func=cmd_acquire)
+
+    rel = sub.add_parser("release", help="low-level: release a registry slot only")
+    rel.add_argument("--path", required=True)
+    _add_config_flags(rel, full=False)
+    rel.set_defaults(func=cmd_release)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    global _QUIET, _VERBOSE
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    _QUIET = bool(getattr(args, "quiet", False))
+    _VERBOSE = bool(getattr(args, "verbose", False))
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
