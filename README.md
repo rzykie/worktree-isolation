@@ -1,49 +1,177 @@
-# worktree-isolation
+# wti — worktree isolation
 
-Per-worktree Postgres + Redis isolation for parallel Claude Code agents.
+Per-worktree Postgres + Redis isolation for `git worktree`. One CLI you can
+call from a terminal, a Makefile, a script, or any AI coding harness.
 
 `git worktree` gives you isolated *files*. It does not give you isolated
-databases, Redis instances, or queues, so two parallel agents on the same
-repo stomp each other's data. This package wires two hooks into Claude
-Code's `WorktreeCreate` / `WorktreeRemove` lifecycle that allocate a
-dedicated Postgres database and a Redis logical DB (1-15) per worktree,
-rewrite the worktree's `.env` to point at them, and clean up on removal.
+databases, Redis instances, or queues, so two parallel sessions on the
+same repo stomp each other's data. `wti` allocates a dedicated Postgres
+database and a Redis logical DB (1-15) per worktree, rewrites the
+worktree's `.env` to point at them, and cleans up on removal.
 
-It also self-heals: when a worktree disappears without going through the
-remove hook (manual `git worktree remove`, `rm -rf`, branch deletion
-after PR merge), the next acquire or remove operation evicts the stale
+It self-heals: when a worktree disappears without going through
+`wti remove` (manual `git worktree remove`, `rm -rf`, branch deletion
+after a PR merge), the next `wti create` or `wti sweep` evicts the stale
 registry entry and reclaims the slot.
 
-## Quickstart
+## Install
 
-From inside a git repository:
+From inside your repo:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/rzykie/worktree-isolation/v0.1.0/install.sh \
+curl -sSL https://raw.githubusercontent.com/rzykie/worktree-isolation/v0.2.0/install.sh \
   | bash -s -- \
       --repo myapp \
-      --worktrees-root "$HOME/.claude/worktrees/myapp" \
-      --registry "$HOME/.myapp-worktrees.json" \
+      --worktrees-root "$HOME/.wti/worktrees/myapp" \
+      --registry "$HOME/.wti/registry.json" \
       --db-prefix myapp_ \
       --template-db myapp_dev \
       --base-branch develop \
-      --bootstrap .claude/hooks/bootstrap.sh
+      --bootstrap .wti/bootstrap.sh
 ```
 
-This drops four files into `.claude/hooks/`:
+This drops `wti` into `~/.local/bin/wti` (override with `--bin-dir`) and
+writes a `.wti.conf` in your repo from the flags. Re-running upgrades
+the binary in place; your `.wti.conf` is preserved.
+
+If `~/.local/bin` isn't already on `$PATH`, the installer prints the
+exact line to add to your shell profile.
+
+## Quickstart
+
+```bash
+wti create feat/checkout-flow
+# → forks a worktree at ~/.wti/worktrees/myapp/checkout_flow,
+#   creates Postgres DB myapp_checkout_flow, allocates Redis DB 3,
+#   rewrites DATABASE_URL/REDIS_URL in the worktree's .env,
+#   runs your bootstrap script.
+
+cd ~/.wti/worktrees/myapp/checkout_flow
+# isolated DB + Redis. Do work.
+
+wti remove feat/checkout-flow
+# → drops the DB, FLUSHDBs the Redis slot, removes the git worktree.
+```
+
+Other commands:
+
+```bash
+wti list                          # active worktrees
+wti inspect [<slug>]              # registry as JSON
+wti sweep                         # evict stale entries; drop orphans
+wti env feat/checkout-flow        # KEY=VAL facts (eval-friendly)
+wti --help
+```
+
+## Lifecycle
+
+### `wti create <branch>`
+
+1. Slugify the branch (strips `feat/`, `fix/`, etc.; lowercase;
+   non-alphanumerics → `_`; truncated to 30 chars).
+2. `git worktree add` from `BASE_BRANCH` (or current `HEAD` if unset).
+3. Acquire a slot in the shared registry. If the slug is new, allocate
+   the next free Redis DB (1-15) and reserve a unique Postgres DB name
+   `${DB_PREFIX}${slug}`. If another repo already created this slug,
+   join its slot instead of creating new resources.
+4. `CREATE DATABASE` (with `TEMPLATE <TEMPLATE_DB>` if configured).
+5. Copy untracked files listed in `.worktreeinclude` (e.g. `.env`)
+   from the main checkout into the worktree.
+6. Rewrite `DATABASE_URL`, `ALEMBIC_DATABASE_URL`, and `REDIS_URL` in
+   the worktree's `.env` to point at the allocated DB + Redis slot.
+7. Run `BOOTSTRAP_HOOK` if configured (e.g. `uv sync`, `npm install`,
+   migrations) with `WORKTREE_PATH`, `DB_NAME`, `REDIS_DB` in env.
+
+### `wti remove <branch>`
+
+1. `git worktree remove` the worktree.
+2. Release the slot from the registry. If this was the last repo using
+   the slug, drop the Postgres database and `FLUSHDB` the Redis slot.
+3. Sweep: any other registry entries whose member paths no longer exist
+   on disk are evicted, and their orphaned databases + Redis slots are
+   cleaned up too. This is what makes the registry self-healing — it
+   does not rely on this command running for every removal.
+
+## Sister-repo coupling
+
+Two repos that point at the same `REGISTRY_PATH` share slots. When their
+slugified branch names match, the second repo's `wti create` joins the
+first's slot instead of allocating new resources.
+
+Example — a backend (`feat/checkout-flow`) and a frontend
+(`checkout-flow`) both slugify to `checkout_flow` and share one Postgres
+DB + one Redis slot. The slot is only released and the DB only dropped
+after **all** member worktrees have been removed.
+
+## Configuration
+
+`.wti.conf` (in your repo, generated by the installer):
+
+| key | required | default | meaning |
+|---|---|---|---|
+| `REPO_NAME` | yes | – | logical name stored alongside this repo's slugs in the registry |
+| `WORKTREES_ROOT` | yes | – | where new worktrees land (one subdir per slug) |
+| `REGISTRY_PATH` | yes | – | shared registry JSON file (sister repos point here too) |
+| `DB_PREFIX` | yes | `wt_` | prefix for generated DB names; final = `${DB_PREFIX}${slug}` |
+| `TEMPLATE_DB` | no | empty | if set, `CREATE DATABASE ... TEMPLATE <TEMPLATE_DB>` |
+| `BASE_BRANCH` | no | current `HEAD` | branch to fork new worktrees from |
+| `BOOTSTRAP_HOOK` | no | empty | path (relative to worktree) to a project setup script |
+| `WORKTREE_INCLUDE_FILE` | no | `.worktreeinclude` | listing of untracked files to copy into each worktree |
+| `MAX_REDIS_DB` | no | `15` | highest Redis logical DB number to allocate |
+| `PG_HOST` | no | empty | passed as `psql -h <host>` if set |
+| `REDIS_HOST` | no | empty | passed as `redis-cli -h <host>` if set |
+
+Resolution order (last wins): defaults → config file → `WTI_*` env vars
+→ command-line flags. The config file is found in this order: explicit
+`--config <path>`, `$WTI_CONFIG`, `./.wti.conf`,
+`./.claude/hooks/worktree-isolation.conf` (back-compat),
+`~/.config/wti/config`.
+
+The bootstrap script receives `WORKTREE_PATH`, `DB_NAME`, `REDIS_DB` in
+the environment, runs from `cd $WORKTREE_PATH`, and may exit non-zero —
+that is logged as a warning but does not fail worktree creation. See
+`examples/bootstrap.sh.example`.
+
+## Output and exit codes
+
+By default progress goes to stderr; stdout is empty (so it's safe to
+redirect or pipe). With `--json`, `wti create` and `wti remove` emit a
+single JSON object on stdout — easy to consume from scripts or harness
+adapters:
+
+```bash
+$ wti create feat/foo --json | jq -r .path
+/Users/me/.wti/worktrees/myapp/foo
+```
+
+Exit codes:
+
+| code | meaning |
+|---|---|
+| 0 | success |
+| 1 | runtime error (git/DB/Redis/bootstrap failed) |
+| 2 | usage error (bad flags, missing required config) |
+| 3 | not found (remove/inspect a slug that isn't in the registry) |
+| 4 | conflict (worktree path exists and isn't ours, slug taken by another repo) |
+
+## Harness adapters
+
+`wti` is designed to be called directly. For tools that drive worktree
+creation through their own lifecycle hooks, ship a thin adapter that
+translates the tool's IO contract into a `wti` call.
+
+### Claude Code
+
+Pass `--harness claude-code` to the installer to drop two adapter scripts
+into `.claude/hooks/`:
 
 ```
 .claude/hooks/
-├── worktree-create.sh
-├── worktree-remove.sh
-├── worktree-isolation.conf      (generated from your flags)
-├── bootstrap.sh.example         (copy → bootstrap.sh, edit for your project)
-└── lib/
-    ├── worktree-common.sh
-    └── registry.py
+├── worktree-create.sh   # parses Claude's stdin JSON, calls `wti create --json`
+└── worktree-remove.sh   # calls `wti remove`
 ```
 
-Then wire the hooks into Claude Code's settings (`.claude/settings.json`):
+Then wire them into `.claude/settings.json`:
 
 ```json
 {
@@ -56,104 +184,29 @@ Then wire the hooks into Claude Code's settings (`.claude/settings.json`):
 }
 ```
 
-Create a worktree from Claude Code and it will land in
-`$WORKTREES_ROOT/<slug>/` with its own database `myapp_<slug>` and Redis
-DB number assigned from the pool.
+### Other tools
 
-## Lifecycle
-
-### `WorktreeCreate`
-
-1. Slugify the branch name (strips `feat/`, `fix/`, etc.; lowercase;
-   non-alphanumerics → `_`; truncated to 30 chars).
-2. `git worktree add` from `BASE_BRANCH` (or current HEAD if unset).
-3. Acquire a slot in the shared registry. If the slug is new, allocate
-   the next free Redis DB (1-15) and reserve a unique Postgres DB name
-   `${DB_PREFIX}${slug}`. If another repo already created this slug,
-   join its slot instead of creating a new one.
-4. `CREATE DATABASE` (with `TEMPLATE <TEMPLATE_DB>` if configured).
-5. Copy untracked files listed in `.worktreeinclude` (e.g. `.env`)
-   from the main checkout into the worktree.
-6. Rewrite `DATABASE_URL`, `ALEMBIC_DATABASE_URL`, and `REDIS_URL` in
-   the worktree's `.env` to point at the allocated DB and Redis slot.
-7. Run `BOOTSTRAP_HOOK` if configured (e.g. `uv sync`, `npm install`,
-   migrations) with `WORKTREE_PATH`, `DB_NAME`, `REDIS_DB` in the env.
-
-### `WorktreeRemove`
-
-1. Release the slot from the registry. If this was the last repo using
-   the slug, drop the Postgres database and `FLUSHDB` the Redis slot.
-2. Sweep: any other registry entries whose member paths no longer exist
-   on disk are evicted, and their orphaned databases + Redis slots get
-   cleaned up too. This is what makes the registry self-healing — it
-   does not rely on this hook firing for every removal.
-
-## Sister-repo coupling
-
-Two repos that point at the same `REGISTRY_PATH` share slots. When their
-slugified branch names match, the second repo's `WorktreeCreate` will
-join the first one's slot instead of allocating new resources.
-
-Example — a backend (`feat/checkout-flow`) and a frontend (`checkout-flow`)
-both slugify to `checkout_flow` and share one Postgres DB + one Redis slot.
-
-The slot is only released and the DB only dropped after **all** member
-worktrees have been removed.
-
-## Configuration reference
-
-`.claude/hooks/worktree-isolation.conf` (sourced as bash):
-
-| variable | required | default | meaning |
-|---|---|---|---|
-| `REPO_NAME` | yes | – | logical name stored alongside this repo's slugs in the registry |
-| `WORKTREES_ROOT` | yes | – | where new worktrees land (one subdir per slug) |
-| `REGISTRY_PATH` | yes | – | shared registry JSON file (sister repos point here too) |
-| `DB_PREFIX` | yes | – | prefix for generated DB names; final = `${DB_PREFIX}${slug}` |
-| `TEMPLATE_DB` | no | empty | if set, `CREATE DATABASE ... TEMPLATE <TEMPLATE_DB>` |
-| `BASE_BRANCH` | no | current HEAD | branch to fork new worktrees from |
-| `BOOTSTRAP_HOOK` | no | empty | path (relative to worktree) to project setup script |
-| `WORKTREE_INCLUDE_FILE` | no | `.worktreeinclude` | listing of untracked files to copy into each worktree |
-
-The bootstrap script receives `WORKTREE_PATH`, `DB_NAME`, `REDIS_DB` in the
-environment, runs from `cd $WORKTREE_PATH`, and may exit non-zero — that
-is logged as a warning but does not fail the worktree creation. See
-`hooks/bootstrap.sh.example`.
-
-## Manual ops
-
-```bash
-# Inspect the registry.
-python3 .claude/hooks/lib/registry.py inspect
-
-# Force a sweep (evict stale slugs, drop orphaned DBs and Redis slots).
-# Usually unnecessary — the create and remove hooks both sweep automatically.
-python3 .claude/hooks/lib/registry.py sweep
-
-# Manually release a slot (does NOT drop the DB — that only happens via
-# the remove hook or sweep).
-python3 .claude/hooks/lib/registry.py release --path /path/to/worktree
-```
+The adapters are six lines each — see `adapters/claude-code/*.sh` for a
+template. Read whatever your harness pipes in, call `wti create <branch>`
+or `wti remove <branch>`, surface the result however your harness expects
+(stdout contract, exit code, etc.).
 
 ## Requirements
 
-- bash ≥ 4
+- bash ≥ 4 (for the installer and adapters)
 - python3 ≥ 3.9
-- `psql` reachable as the user running the hook (no password prompts —
-  use `~/.pgpass` or a trust/peer auth setup for `localhost`)
-- `redis-cli` reachable on `redis://localhost:6379`
+- `psql` reachable as the user running `wti` (no password prompts —
+  use `~/.pgpass` or trust/peer auth for `localhost`)
+- `redis-cli` reachable on `redis://localhost:6379` (override host with
+  `REDIS_HOST` in `.wti.conf`)
 - a Postgres role with `CREATE DATABASE` privileges
-
-The hooks assume Postgres on `localhost` and Redis on `localhost:6379`.
-Override by editing `worktree-common.sh` (the `apply_env_overrides` regex)
-if you need something different.
 
 ## Versioning
 
-The `install.sh` URL pins to a tag: `…/refs/tags/v0.1.0/install.sh`.
-Re-running the installer with the same flags upgrades the lib in place,
-keeping your `worktree-isolation.conf` and `bootstrap.sh` untouched.
-Pass `--ref <tag-or-branch>` to install a different version.
+The `install.sh` URL pins to a tag: `…/refs/tags/v0.2.0/install.sh`.
+Re-running the installer upgrades `wti` in place, keeping your
+`.wti.conf` and Claude Code adapter scripts untouched. Pass
+`--ref <tag-or-branch>` to install a different version.
 
 ## License
 

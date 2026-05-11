@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
-# worktree-isolation installer.
+# wti installer.
 #
-# Usage (from inside a git repo):
-#   curl -sSL https://raw.githubusercontent.com/rzykie/worktree-isolation/v0.1.0/install.sh \
+# Usage (from inside a git repo, or run with --target):
+#   curl -sSL https://raw.githubusercontent.com/rzykie/worktree-isolation/v0.2.0/install.sh \
 #     | bash -s -- \
 #         --repo myapp \
-#         --worktrees-root "$HOME/.claude/worktrees/myapp" \
-#         --registry "$HOME/.myapp-worktrees.json" \
+#         --worktrees-root "$HOME/.wti/worktrees/myapp" \
+#         --registry "$HOME/.wti/registry.json" \
 #         --db-prefix myapp_ \
 #         [--template-db myapp_dev] \
 #         [--base-branch develop] \
-#         [--bootstrap .claude/hooks/bootstrap.sh] \
-#         [--target /path/to/repo]   # default: pwd
+#         [--bootstrap .wti/bootstrap.sh] \
+#         [--harness claude-code]   # also drop Claude Code hook adapters
+#         [--bin-dir "$HOME/.local/bin"]
+#         [--target /path/to/repo]  # default: pwd
 #
-# Drops files into <target>/.claude/hooks/ and writes worktree-isolation.conf
-# from the supplied flags. Idempotent — re-running upgrades the lib but
-# preserves your conf and bootstrap.sh.
+# Drops a single executable `wti` into BIN_DIR (default ~/.local/bin/wti)
+# and writes <target>/.wti.conf from the supplied flags. With
+# `--harness claude-code`, also copies the two hook adapter scripts into
+# <target>/.claude/hooks/ so Claude Code can call wti via WorktreeCreate /
+# WorktreeRemove. Re-running upgrades the binary in place; the conf and
+# adapter scripts are preserved if already present.
 
 set -euo pipefail
 
-REF="${WORKTREE_ISOLATION_REF:-v0.1.0}"
+REF="${WTI_REF:-v0.2.0}"
 REPO_SLUG="rzykie/worktree-isolation"
 
 REPO_NAME=""
@@ -29,10 +34,12 @@ DB_PREFIX=""
 TEMPLATE_DB=""
 BASE_BRANCH=""
 BOOTSTRAP_HOOK=""
+HARNESS="none"
+BIN_DIR="$HOME/.local/bin"
 TARGET="$(pwd)"
 
 usage() {
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -45,6 +52,8 @@ while [[ $# -gt 0 ]]; do
         --template-db)     TEMPLATE_DB="$2"; shift 2 ;;
         --base-branch)     BASE_BRANCH="$2"; shift 2 ;;
         --bootstrap)       BOOTSTRAP_HOOK="$2"; shift 2 ;;
+        --harness)         HARNESS="$2"; shift 2 ;;
+        --bin-dir)         BIN_DIR="$2"; shift 2 ;;
         --target)          TARGET="$2"; shift 2 ;;
         --ref)             REF="$2"; shift 2 ;;
         -h|--help)         usage 0 ;;
@@ -60,20 +69,23 @@ err() { echo "install.sh: $*" >&2; exit 1; }
 [[ -z "$DB_PREFIX" ]]       && err "--db-prefix is required"
 [[ ! -d "$TARGET" ]]        && err "target directory does not exist: $TARGET"
 
+case "$HARNESS" in
+    none|claude-code) ;;
+    *) err "unknown --harness: $HARNESS (supported: none, claude-code)" ;;
+esac
+
 for cmd in curl tar python3; do
     command -v "$cmd" >/dev/null 2>&1 || err "required command not found: $cmd"
 done
 
-HOOKS_DIR="$TARGET/.claude/hooks"
-mkdir -p "$HOOKS_DIR/lib"
+mkdir -p "$BIN_DIR"
 
 TARBALL_URL="https://codeload.github.com/${REPO_SLUG}/tar.gz/refs/tags/${REF}"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-echo "→ downloading worktree-isolation@${REF}"
+echo "→ downloading wti@${REF}"
 if ! curl -fsSL "$TARBALL_URL" | tar -xz -C "$TMPDIR"; then
-    # tag may not exist yet; fall back to a branch ref
     BRANCH_URL="https://codeload.github.com/${REPO_SLUG}/tar.gz/refs/heads/${REF}"
     echo "  tag not found; trying branch '${REF}'"
     curl -fsSL "$BRANCH_URL" | tar -xz -C "$TMPDIR" \
@@ -82,26 +94,31 @@ fi
 
 SRC="$(find "$TMPDIR" -maxdepth 1 -type d -name 'worktree-isolation-*' | head -n1)"
 [[ -z "$SRC" ]] && err "extracted archive did not contain expected directory"
+[[ -f "$SRC/wti" ]] || err "extracted archive did not contain wti binary"
 
-echo "→ installing hooks into $HOOKS_DIR"
-install -m 0755 "$SRC/hooks/worktree-create.sh" "$HOOKS_DIR/worktree-create.sh"
-install -m 0755 "$SRC/hooks/worktree-remove.sh" "$HOOKS_DIR/worktree-remove.sh"
-install -m 0644 "$SRC/hooks/lib/worktree-common.sh" "$HOOKS_DIR/lib/worktree-common.sh"
-install -m 0755 "$SRC/hooks/lib/registry.py" "$HOOKS_DIR/lib/registry.py"
+echo "→ installing wti to $BIN_DIR/wti"
+install -m 0755 "$SRC/wti" "$BIN_DIR/wti"
 
-if [[ -e "$HOOKS_DIR/bootstrap.sh.example" ]]; then
-    echo "  keeping existing bootstrap.sh.example"
-else
-    install -m 0644 "$SRC/hooks/bootstrap.sh.example" "$HOOKS_DIR/bootstrap.sh.example"
+if [[ "$HARNESS" == "claude-code" ]]; then
+    HOOKS_DIR="$TARGET/.claude/hooks"
+    mkdir -p "$HOOKS_DIR"
+    for f in worktree-create.sh worktree-remove.sh; do
+        if [[ -e "$HOOKS_DIR/$f" ]]; then
+            echo "  keeping existing $HOOKS_DIR/$f"
+        else
+            install -m 0755 "$SRC/adapters/claude-code/$f" "$HOOKS_DIR/$f"
+            echo "  installed $HOOKS_DIR/$f"
+        fi
+    done
 fi
 
-CONF="$HOOKS_DIR/worktree-isolation.conf"
+CONF="$TARGET/.wti.conf"
 if [[ -e "$CONF" ]]; then
     echo "  keeping existing $CONF (delete and re-run to regenerate)"
 else
     echo "→ writing $CONF"
     {
-        echo "# Generated by worktree-isolation install.sh @ ${REF}"
+        echo "# Generated by wti install.sh @ ${REF}"
         echo "REPO_NAME=$REPO_NAME"
         echo "WORKTREES_ROOT=$WORKTREES_ROOT"
         echo "REGISTRY_PATH=$REGISTRY_PATH"
@@ -113,25 +130,48 @@ else
     chmod 0644 "$CONF"
 fi
 
+ON_PATH="no"
+case ":$PATH:" in
+    *":$BIN_DIR:"*) ON_PATH="yes" ;;
+esac
+
 cat <<EOF
 
-✓ installed worktree-isolation@${REF} into $HOOKS_DIR
+✓ installed wti@${REF} to $BIN_DIR/wti
+✓ wrote $CONF
+EOF
 
-next steps:
-  1. (optional) cp .claude/hooks/bootstrap.sh.example .claude/hooks/bootstrap.sh
-     edit it to run your project's setup (uv sync, npm install, migrations)
-     chmod +x .claude/hooks/bootstrap.sh
-  2. wire the hooks into Claude Code's worktree settings (.claude/settings.json):
-       "hooks": {
-         "WorktreeCreate": [{"hooks": [{"type": "command",
-            "command": ".claude/hooks/worktree-create.sh"}]}],
-         "WorktreeRemove": [{"hooks": [{"type": "command",
-            "command": ".claude/hooks/worktree-remove.sh"}]}]
-       }
-  3. test it by creating a new worktree from Claude Code.
+if [[ "$HARNESS" == "claude-code" ]]; then
+    cat <<EOF
+✓ installed Claude Code adapter hooks in $TARGET/.claude/hooks/
 
-inspect the registry any time:
-  python3 .claude/hooks/lib/registry.py inspect
-manually evict stale entries:
-  python3 .claude/hooks/lib/registry.py sweep
+next steps for Claude Code:
+  add this to your .claude/settings.json:
+    "hooks": {
+      "WorktreeCreate": [{"hooks": [{"type": "command",
+         "command": ".claude/hooks/worktree-create.sh"}]}],
+      "WorktreeRemove": [{"hooks": [{"type": "command",
+         "command": ".claude/hooks/worktree-remove.sh"}]}]
+    }
+EOF
+fi
+
+if [[ "$ON_PATH" == "no" ]]; then
+    cat <<EOF
+
+⚠ $BIN_DIR is not on \$PATH.
+  Add this to your shell profile (~/.zshrc, ~/.bashrc, etc.):
+      export PATH="$BIN_DIR:\$PATH"
+  …or re-run with --bin-dir pointing somewhere already on \$PATH.
+EOF
+fi
+
+cat <<EOF
+
+usage:
+  wti create <branch>              # create worktree + isolated DB + Redis
+  wti remove <branch>              # tear it down + release the slot
+  wti list                         # show active worktrees
+  wti --help                       # all commands
+
 EOF
