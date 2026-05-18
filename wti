@@ -11,6 +11,7 @@ disappears without going through `wti remove`, the next `create` or
 Usage:
   wti create <branch>     create worktree, allocate DB + Redis, run bootstrap
   wti remove <branch>     remove worktree, release slot, drop DB if last user
+  wti remove-all --repo X remove every worktree belonging to repo X
   wti list                show active worktrees
   wti inspect [<slug>]    dump registry (or one slug)
   wti sweep               evict stale entries, drop orphan DBs/Redis
@@ -637,6 +638,32 @@ def _drop_slot(slug: str, db_name: str, redis_db: int, cfg: dict[str, str]) -> N
         warn(f"DROP DATABASE {db_name} failed; you may need to drop manually")
 
 
+def _remove_one(worktree_path: Path, reg: Registry, cfg: dict[str, str],
+                repo_root: Path | None, force: bool) -> dict:
+    """Remove a single worktree by path: git-worktree-remove, release the
+    registry slot, drop the DB + Redis if this was the last member. Returns
+    the release result dict."""
+    log(f"removing worktree: {worktree_path}")
+    if repo_root and worktree_path.exists():
+        try:
+            args_list = ["worktree", "remove", str(worktree_path)]
+            if force:
+                args_list.append("--force")
+            git(str(repo_root), *args_list)
+        except subprocess.CalledProcessError:
+            warn("git worktree remove failed; proceeding with registry cleanup")
+
+    rel = reg.release(str(worktree_path))
+    if rel["found"]:
+        log(f"released slot for slug={rel['slug']} "
+            f"(is_last={rel['is_last']} db={rel['db_name']} redis_db={rel['redis_db']})")
+        if rel["is_last"]:
+            _drop_slot(rel["slug"], rel["db_name"], rel["redis_db"], cfg)
+    else:
+        log(f"no registry entry for path={worktree_path}")
+    return rel
+
+
 def cmd_remove(args: argparse.Namespace) -> int:
     cfg = load_config(args)
     require(cfg, "WORKTREES_ROOT", "REGISTRY_PATH")
@@ -649,33 +676,14 @@ def cmd_remove(args: argparse.Namespace) -> int:
     else:
         die("either <branch> or --path is required", EXIT_USAGE)
 
-    log(f"removing worktree: {worktree_path}")
-
-    # Try to git-worktree-remove first if the path exists. Failures here are
-    # logged but don't block registry release.
     repo_root: Path | None = None
     try:
         repo_root = find_repo_root()
     except SystemExit:
         pass
-    if repo_root and worktree_path.exists():
-        try:
-            args_list = ["worktree", "remove", str(worktree_path)]
-            if args.force:
-                args_list.append("--force")
-            git(str(repo_root), *args_list)
-        except subprocess.CalledProcessError:
-            warn("git worktree remove failed; proceeding with registry cleanup")
 
     reg = make_registry(cfg)
-    rel = reg.release(str(worktree_path))
-    if rel["found"]:
-        log(f"released slot for slug={rel['slug']} "
-            f"(is_last={rel['is_last']} db={rel['db_name']} redis_db={rel['redis_db']})")
-        if rel["is_last"]:
-            _drop_slot(rel["slug"], rel["db_name"], rel["redis_db"], cfg)
-    else:
-        log(f"no registry entry for path={worktree_path}")
+    rel = _remove_one(worktree_path, reg, cfg, repo_root, args.force)
 
     # Opportunistic sweep — closes the loop when other worktrees were
     # removed without going through `wti remove`.
@@ -692,6 +700,82 @@ def cmd_remove(args: argparse.Namespace) -> int:
             "swept": swept,
         })
     return EXIT_OK if rel["found"] else EXIT_NOT_FOUND
+
+
+def cmd_remove_all(args: argparse.Namespace) -> int:
+    cfg = load_config(args)
+    require(cfg, "REGISTRY_PATH")
+
+    repo_filter = args.repo or cfg.get("REPO_NAME")
+    if not repo_filter:
+        die("--repo is required (or set REPO_NAME in config)", EXIT_USAGE)
+
+    reg = make_registry(cfg)
+    data = reg.dump()
+    targets: list[tuple[str, str]] = []  # (slug, path)
+    for slug, entry in sorted(data["slugs"].items()):
+        for m in entry["members"]:
+            if m["repo"] == repo_filter:
+                targets.append((slug, m["path"]))
+
+    if not targets:
+        log(f"no worktrees found for repo='{repo_filter}'")
+        if args.json:
+            emit_json({"repo": repo_filter, "removed": [], "dry_run": args.dry_run})
+        return EXIT_OK
+
+    if args.dry_run:
+        log(f"DRY-RUN: would remove {len(targets)} worktree(s) for repo='{repo_filter}':")
+        for slug, path in targets:
+            log(f"DRY-RUN:   slug={slug} path={path}")
+        if args.json:
+            emit_json({
+                "repo": repo_filter,
+                "dry_run": True,
+                "targets": [{"slug": s, "path": p} for s, p in targets],
+            })
+        return EXIT_OK
+
+    if not args.yes:
+        print(f"About to remove {len(targets)} worktree(s) for repo='{repo_filter}':",
+              file=sys.stderr)
+        for slug, path in targets:
+            print(f"  - {slug}: {path}", file=sys.stderr)
+        try:
+            reply = input("Proceed? [y/N] ").strip().lower()
+        except EOFError:
+            reply = ""
+        if reply not in ("y", "yes"):
+            log("aborted")
+            return EXIT_OK
+
+    repo_root: Path | None = None
+    try:
+        repo_root = find_repo_root()
+    except SystemExit:
+        pass
+
+    removed = []
+    for slug, path in targets:
+        rel = _remove_one(Path(path), reg, cfg, repo_root, args.force)
+        removed.append({"slug": slug, "path": path, "released": rel})
+
+    swept = reg.sweep()
+    for e in swept:
+        log(f"auto-cleanup: evicted stale slug={e['slug']} "
+            f"(db={e['db_name']} redis_db={e['redis_db']})")
+        _drop_slot(e["slug"], e["db_name"], e["redis_db"], cfg)
+
+    log(f"removed {len(removed)} worktree(s) for repo='{repo_filter}'")
+
+    if args.json:
+        emit_json({
+            "repo": repo_filter,
+            "dry_run": False,
+            "removed": removed,
+            "swept": swept,
+        })
+    return EXIT_OK
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -825,6 +909,19 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--json", action="store_true")
     _add_config_flags(r)
     r.set_defaults(func=cmd_remove)
+
+    ra = sub.add_parser("remove-all",
+                        help="remove every worktree belonging to a repo")
+    ra.add_argument("--repo", help="logical repo name (overrides REPO_NAME)")
+    ra.add_argument("--yes", "-y", action="store_true",
+                    help="skip the confirmation prompt")
+    ra.add_argument("--dry-run", action="store_true",
+                    help="list what would be removed without doing it")
+    ra.add_argument("--force", action="store_true",
+                    help="pass --force to `git worktree remove`")
+    ra.add_argument("--json", action="store_true")
+    _add_config_flags(ra, full=False)
+    ra.set_defaults(func=cmd_remove_all)
 
     ls = sub.add_parser("list", help="show active worktrees")
     ls.add_argument("--json", action="store_true")
