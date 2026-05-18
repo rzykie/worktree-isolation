@@ -44,7 +44,7 @@ EXIT_USAGE = 2     # bad flags or missing required config
 EXIT_NOT_FOUND = 3 # remove/inspect a slug that isn't in the registry
 EXIT_CONFLICT = 4  # path exists and isn't ours, slug taken by another repo
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # ----------------------------------------------------------------------------
 # Output helpers. Progress goes to stderr; JSON results go to stdout.
