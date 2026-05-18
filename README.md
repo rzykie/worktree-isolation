@@ -19,7 +19,7 @@ registry entry and reclaims the slot.
 From inside your repo:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/rzykie/worktree-isolation/v0.2.0/install.sh \
+curl -sSL https://raw.githubusercontent.com/rzykie/worktree-isolation/v0.3.0/install.sh \
   | bash -s -- \
       --repo myapp \
       --worktrees-root "$HOME/.wti/worktrees/myapp" \
@@ -213,7 +213,7 @@ or `wti remove <branch>`, surface the result however your harness expects
 
 ## Versioning
 
-The `install.sh` URL pins to a tag: `…/refs/tags/v0.2.0/install.sh`.
+The `install.sh` URL pins to a tag: `…/refs/tags/v0.3.0/install.sh`.
 Re-running the installer upgrades `wti` in place, keeping your
 `.wti.conf` and Claude Code adapter scripts untouched. Pass
 `--ref <tag-or-branch>` to install a different version.

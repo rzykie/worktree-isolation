@@ -2,7 +2,7 @@
 # wti installer.
 #
 # Usage (from inside a git repo, or run with --target):
-#   curl -sSL https://raw.githubusercontent.com/rzykie/worktree-isolation/v0.2.0/install.sh \
+#   curl -sSL https://raw.githubusercontent.com/rzykie/worktree-isolation/v0.3.0/install.sh \
 #     | bash -s -- \
 #         --repo myapp \
 #         --worktrees-root "$HOME/.wti/worktrees/myapp" \
@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-REF="${WTI_REF:-v0.2.0}"
+REF="${WTI_REF:-v0.3.0}"
 REPO_SLUG="rzykie/worktree-isolation"
 
 REPO_NAME=""
