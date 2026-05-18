@@ -60,6 +60,7 @@ wti list                          # active worktrees
 wti inspect [<slug>]              # registry as JSON
 wti sweep                         # evict stale entries; drop orphans
 wti env feat/checkout-flow        # KEY=VAL facts (eval-friendly)
+wti remove-all --repo myapp       # tear down every worktree for one repo
 wti --help
 ```
 
@@ -91,6 +92,15 @@ wti --help
    on disk are evicted, and their orphaned databases + Redis slots are
    cleaned up too. This is what makes the registry self-healing — it
    does not rely on this command running for every removal.
+
+### `wti remove-all --repo <name>`
+
+Bulk-remove every worktree whose member belongs to the given repo. Each
+target is removed the same way `wti remove` would handle it: per-member,
+so a slug shared with a sister repo keeps its DB until the sister also
+releases it. Prompts for confirmation; pass `-y`/`--yes` to skip, or
+`--dry-run` to preview. `--repo` defaults to `REPO_NAME` from config if
+unset.
 
 ## Sister-repo coupling
 
