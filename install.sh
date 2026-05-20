@@ -2,12 +2,12 @@
 # wti installer.
 #
 # Usage (from inside a git repo, or run with --target):
-#   curl -sSL https://raw.githubusercontent.com/rzykie/worktree-isolation/v0.3.0/install.sh \
+#   curl -sSL https://raw.githubusercontent.com/rzykie/worktree-isolation/v0.4.0/install.sh \
 #     | bash -s -- \
-#         --repo myapp \
-#         --worktrees-root "$HOME/.wti/worktrees/myapp" \
-#         --registry "$HOME/.wti/registry.json" \
-#         --db-prefix myapp_ \
+#         [--repo myapp]                # default: basename of --target
+#         [--worktrees-root PATH]       # default: $HOME/.wti/worktrees/<repo>
+#         [--registry PATH]             # default: $HOME/.wti/registry.json
+#         [--db-prefix PFX]             # default: <repo>_  (sanitized)
 #         [--template-db myapp_dev] \
 #         [--base-branch develop] \
 #         [--bootstrap .wti/bootstrap.sh] \
@@ -16,7 +16,9 @@
 #         [--target /path/to/repo]  # default: pwd
 #
 # Drops a single executable `wti` into BIN_DIR (default ~/.local/bin/wti)
-# and writes <target>/.wti.conf from the supplied flags. With
+# and writes <target>/.wti.conf. With no flags, all required config is
+# derived from the target directory's name, so adding wti to a second
+# project is just `install.sh --harness claude-code`. With
 # `--harness claude-code`, also copies the two hook adapter scripts into
 # <target>/.claude/hooks/ so Claude Code can call wti via WorktreeCreate /
 # WorktreeRemove. Re-running upgrades the binary in place; the conf and
@@ -24,7 +26,7 @@
 
 set -euo pipefail
 
-REF="${WTI_REF:-v0.3.0}"
+REF="${WTI_REF:-v0.4.0}"
 REPO_SLUG="rzykie/worktree-isolation"
 
 REPO_NAME=""
@@ -63,11 +65,48 @@ done
 
 err() { echo "install.sh: $*" >&2; exit 1; }
 
-[[ -z "$REPO_NAME" ]]       && err "--repo is required"
-[[ -z "$WORKTREES_ROOT" ]]  && err "--worktrees-root is required"
-[[ -z "$REGISTRY_PATH" ]]   && err "--registry is required"
-[[ -z "$DB_PREFIX" ]]       && err "--db-prefix is required"
-[[ ! -d "$TARGET" ]]        && err "target directory does not exist: $TARGET"
+[[ ! -d "$TARGET" ]] && err "target directory does not exist: $TARGET"
+
+# Resolve TARGET to an absolute path so derived defaults are stable when
+# the installer is run with a relative --target.
+TARGET="$(cd "$TARGET" && pwd)"
+
+# Sanitize a string into a valid Postgres identifier prefix component:
+# lowercase, alnum/underscore only, no leading digit.
+sanitize_repo() {
+    python3 -c '
+import re, sys
+s = sys.argv[1].lower()
+s = re.sub(r"[^a-z0-9_]+", "_", s).strip("_")
+if not s or s[0].isdigit():
+    s = "wt_" + s
+print(s)
+' "$1"
+}
+
+# Derive sensible defaults from the target directory so a bare invocation
+# Just Works for new projects. Explicit flags still win.
+if [[ -z "$REPO_NAME" ]]; then
+    REPO_NAME="$(basename "$TARGET")"
+    echo "→ deriving --repo=$REPO_NAME from target dir"
+fi
+
+REPO_SAFE="$(sanitize_repo "$REPO_NAME")"
+
+if [[ -z "$WORKTREES_ROOT" ]]; then
+    WORKTREES_ROOT="$HOME/.wti/worktrees/$REPO_SAFE"
+    echo "→ deriving --worktrees-root=$WORKTREES_ROOT"
+fi
+
+if [[ -z "$REGISTRY_PATH" ]]; then
+    REGISTRY_PATH="$HOME/.wti/registry.json"
+    echo "→ deriving --registry=$REGISTRY_PATH"
+fi
+
+if [[ -z "$DB_PREFIX" ]]; then
+    DB_PREFIX="${REPO_SAFE}_"
+    echo "→ deriving --db-prefix=$DB_PREFIX"
+fi
 
 case "$HARNESS" in
     none|claude-code) ;;
