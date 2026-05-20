@@ -44,7 +44,7 @@ EXIT_USAGE = 2     # bad flags or missing required config
 EXIT_NOT_FOUND = 3 # remove/inspect a slug that isn't in the registry
 EXIT_CONFLICT = 4  # path exists and isn't ours, slug taken by another repo
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # ----------------------------------------------------------------------------
 # Output helpers. Progress goes to stderr; JSON results go to stdout.
@@ -422,6 +422,18 @@ def psql_exec(sql: str, *, host: str | None = None) -> None:
     run(cmd, prefix="psql")
 
 
+def psql_db_exists(db_name: str, *, host: str | None = None) -> bool:
+    """Return True if a database with this name exists. Returns False on any
+    psql error (e.g. server not running) so the caller can surface a clearer
+    message at the point of failure."""
+    cmd = ["psql", "-d", "postgres", "-tAc",
+           f"SELECT 1 FROM pg_database WHERE datname='{db_name}'"]
+    if host:
+        cmd[1:1] = ["-h", host]
+    p = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    return p.returncode == 0 and p.stdout.strip() == "1"
+
+
 def redis_flush(db_n: int, *, host: str | None = None) -> None:
     cmd = ["redis-cli", "-n", str(db_n), "FLUSHDB"]
     if host:
@@ -533,10 +545,24 @@ def cmd_create(args: argparse.Namespace) -> int:
     cfg = load_config(args)
     require(cfg, "REPO_NAME", "WORKTREES_ROOT", "REGISTRY_PATH", "DB_PREFIX")
 
+    if getattr(args, "no_template_db", False):
+        cfg["TEMPLATE_DB"] = ""
+
     branch = args.branch
     slug = slugify_branch(branch)
     if not slug:
         die(f"could not derive slug from branch='{branch}'", EXIT_USAGE)
+
+    # Pre-flight: if a template DB is configured, verify it exists before we
+    # mutate any state. A missing template would otherwise fail late, after
+    # `git worktree add` and registry slot acquisition, leaving partial state.
+    template = cfg.get("TEMPLATE_DB", "")
+    if template and not args.dry_run and not psql_db_exists(
+            template, host=cfg.get("PG_HOST")):
+        die(f"TEMPLATE_DB '{template}' does not exist in Postgres. "
+            f"Either create it, change TEMPLATE_DB in your .wti.conf, "
+            f"or rerun with --no-template-db to create an empty database.",
+            EXIT_USAGE)
 
     repo_root = find_repo_root()
     worktrees_root = Path(cfg["WORKTREES_ROOT"]).expanduser()
@@ -898,6 +924,8 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--json", action="store_true", help="emit JSON result on stdout")
     c.add_argument("--dry-run", action="store_true",
                    help="print plan without doing anything")
+    c.add_argument("--no-template-db", action="store_true",
+                   help="ignore configured TEMPLATE_DB; create an empty database")
     _add_config_flags(c)
     c.set_defaults(func=cmd_create)
 
