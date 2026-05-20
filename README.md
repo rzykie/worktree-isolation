@@ -19,20 +19,28 @@ registry entry and reclaims the slot.
 From inside your repo:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/rzykie/worktree-isolation/v0.3.0/install.sh \
+curl -sSL https://raw.githubusercontent.com/rzykie/worktree-isolation/v0.4.0/install.sh \
+  | bash
+```
+
+That's it. The installer derives `--repo` from the target directory's
+name, defaults `--worktrees-root` to `$HOME/.wti/worktrees/<repo>`,
+`--registry` to `$HOME/.wti/registry.json`, and `--db-prefix` to
+`<repo>_`. Override any of them with explicit flags if the defaults
+don't suit you:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/rzykie/worktree-isolation/v0.4.0/install.sh \
   | bash -s -- \
-      --repo myapp \
-      --worktrees-root "$HOME/.wti/worktrees/myapp" \
-      --registry "$HOME/.wti/registry.json" \
-      --db-prefix myapp_ \
       --template-db myapp_dev \
       --base-branch develop \
-      --bootstrap .wti/bootstrap.sh
+      --bootstrap .wti/bootstrap.sh \
+      --harness claude-code
 ```
 
 This drops `wti` into `~/.local/bin/wti` (override with `--bin-dir`) and
-writes a `.wti.conf` in your repo from the flags. Re-running upgrades
-the binary in place; your `.wti.conf` is preserved.
+writes a `.wti.conf` in your repo. Re-running upgrades the binary in
+place; your `.wti.conf` is preserved.
 
 If `~/.local/bin` isn't already on `$PATH`, the installer prints the
 exact line to add to your shell profile.
@@ -75,7 +83,11 @@ wti --help
    the next free Redis DB (1-15) and reserve a unique Postgres DB name
    `${DB_PREFIX}${slug}`. If another repo already created this slug,
    join its slot instead of creating new resources.
-4. `CREATE DATABASE` (with `TEMPLATE <TEMPLATE_DB>` if configured).
+4. `CREATE DATABASE` (with `TEMPLATE <TEMPLATE_DB>` if configured). The
+   template DB's existence is checked up front, before any git or
+   registry mutation, so a missing template fails cleanly without
+   orphaning state. Pass `--no-template-db` to ignore a configured
+   `TEMPLATE_DB` and create an empty database instead.
 5. Copy untracked files listed in `.worktreeinclude` (e.g. `.env`)
    from the main checkout into the worktree.
 6. Rewrite `DATABASE_URL`, `ALEMBIC_DATABASE_URL`, and `REDIS_URL` in
@@ -213,7 +225,7 @@ or `wti remove <branch>`, surface the result however your harness expects
 
 ## Versioning
 
-The `install.sh` URL pins to a tag: `…/refs/tags/v0.3.0/install.sh`.
+The `install.sh` URL pins to a tag: `…/refs/tags/v0.4.0/install.sh`.
 Re-running the installer upgrades `wti` in place, keeping your
 `.wti.conf` and Claude Code adapter scripts untouched. Pass
 `--ref <tag-or-branch>` to install a different version.
